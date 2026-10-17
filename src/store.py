@@ -690,8 +690,20 @@ def _bundled_ld_path(usr):
     return sorted(found, key=lambda d: (d.count(os.sep), d))
 
 
+ATL_XDG_DIR = os.path.join(DATA_DIR, "atl-xdg")
+
+
 def _launch_env(cmd):
     env = dict(os.environ)
+    # A confined app may only write inside its own folders; ATL stores each app's data under
+    # $XDG_DATA_HOME/android_translation_layer, so point it (and its cache/config) into our writable folder.
+    for var, sub in (("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache"), ("XDG_CONFIG_HOME", "config")):
+        path = os.path.join(ATL_XDG_DIR, sub)
+        try:
+            os.makedirs(path, exist_ok=True)
+            env[var] = path
+        except OSError:
+            pass
     usr = sdk_root()
     dirs = []
     if usr and os.path.abspath(cmd[0]).startswith(usr + os.sep):
@@ -713,8 +725,12 @@ def _missing_libs(cmd):
     try:
         out = subprocess.run(["ldd", exe], env=_launch_env(cmd), capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
-        return []
-    return [m.group(1) for m in re.finditer(r"^\s*(\S+) => not found", out, re.M)]
+        out = ""
+    found = [m.group(1) for m in re.finditer(r"^\s*(\S+) => not found", out, re.M)]
+    if found:
+        return found
+    # ldd is missing or printed nothing useful on the phone: fall back to the pure-Python ELF check
+    return _missing_libs_py(exe)
 
 
 # ---------- dependency check without ldd (works in a confined app) ----------
