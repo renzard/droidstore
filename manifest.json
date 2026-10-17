@@ -1,0 +1,15 @@
+{
+    "name": "atlstore.renz21",
+    "description": "Android app store for Ubuntu Touch via the Android Translation Layer",
+    "architecture": "$ENV{CLICK_ARCH}",
+    "title": "ATL Store",
+    "hooks": {
+        "atlstore": {
+            "apparmor": "atlstore.apparmor",
+            "desktop": "atlstore.desktop"
+        }
+    },
+    "version": "0.1.1",
+    "maintainer": "renz21 <renzardpolitakis@gmail.com>",
+    "framework": "ubuntu-sdk-20.04"
+}

@@ -1,0 +1,4 @@
+clickable_minimum_required: 7.0.0
+builder: precompiled
+restrict_arch: arm64
+kill: qmlscene
