@@ -1,0 +1,43 @@
+name: Build click package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, merge-atl]
+
+jobs:
+  build:
+    # native arm64 runner: no qemu, much faster than building on a PC
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ATL and bundle all its libraries (usr/)
+        run: ./tools/build_atl.sh
+
+      - name: Install clickable
+        run: pip install clickable-ut
+
+      - name: Package the click
+        run: clickable build --arch arm64 --skip-review
+
+      - name: Find the click
+        run: |
+          find . -name '*.click' -not -path './atl/*' -print | tee /tmp/clicks.txt
+          test -s /tmp/clicks.txt || { echo "no .click was produced"; exit 1; }
+          echo "--- contents (usr/ must be there, atl/ must not) ---"
+          unzip -l "$(head -1 /tmp/clicks.txt)" 2>/dev/null | grep -E ' (usr|atl)/' | head -5 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atlstore-click
+          path: "**/*.click"
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: atl-build-info
+          path: usr/share/atl-build-info.txt
+          if-no-files-found: ignore
