@@ -18,6 +18,7 @@ MainView {
     property real sdkProgress: 0
     property string sdkPhase: ""
     property string pendingLaunch: ""
+    property string lastRunPkg: ""   // last app launched: its log can be opened
     property var detailsPage: null   // the open details page (if any)
 
     ListModel { id: storeModel }
@@ -53,6 +54,14 @@ MainView {
             setHandler("catalog_error", function(message) {
                 root.catalogBusy = false;
                 root.statusText = "Catalog error: " + message;
+            });
+
+            setHandler("app_exited", function(pkg, code, runtime, description, tail) {
+                root.lastRunPkg = pkg;
+                if (code !== 0) {
+                    root.statusText = "The app closed after " + runtime + "s (" + description + "). "
+                        + "Tap here to see the log.";
+                }
             });
 
             setHandler("sdk_progress", function(phase, fraction) {
@@ -165,6 +174,7 @@ MainView {
             return;
         }
         statusText = "Launching… (the first time, system libraries are downloaded and it may take a while)";
+        lastRunPkg = pkg;
         py.call("store.launch", [pkg], function(result) {
             if (!result.ok && result.needs_sdk) {
                 root.sdkMissing = true;
@@ -209,6 +219,12 @@ MainView {
                         onTriggered: root.updateCatalog()
                     },
                     Action {
+                        iconName: "document-open"
+                        text: "Last log"
+                        enabled: root.lastRunPkg !== ""
+                        onTriggered: stack.push(Qt.resolvedUrl("LogPage.qml"), { py: py, pkgId: root.lastRunPkg })
+                    },
+                    Action {
                         iconName: "settings"
                         text: "Settings"
                         onTriggered: stack.push(Qt.resolvedUrl("SettingsPage.qml"), { py: py })
@@ -245,6 +261,12 @@ MainView {
                     wrapMode: Text.WordWrap
                     fontSize: "small"
                     color: theme.palette.normal.backgroundSecondaryText
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: root.lastRunPkg !== "" && statusLabel.text.indexOf("log") !== -1
+                        onClicked: stack.push(Qt.resolvedUrl("LogPage.qml"), { py: py, pkgId: root.lastRunPkg })
+                    }
                 }
 
                 Column {

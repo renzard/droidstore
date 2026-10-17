@@ -3,6 +3,7 @@
 Downloads APKs, verifies sha256, keeps them in a library and opens them with the
 Android Translation Layer (ATL).
 """
+import glob
 import gzip
 import hashlib
 import io
@@ -12,6 +13,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import struct
 import subprocess
@@ -102,6 +104,10 @@ DEFAULT_SETTINGS = {
     "repo_url": "https://f-droid.org/repo",
     # If set, a prebuilt small catalog.json is downloaded instead of the whole F-Droid index
     "catalog_url": "",
+    # Diagnostics: extra environment variables for ATL, e.g. "G_MESSAGES_DEBUG=all FOO=bar"
+    "extra_env": "",
+    # Diagnostics: extra arguments placed between the ATL command and the APK
+    "extra_args": "",
 }
 
 PKG_RE = re.compile(r"^[A-Za-z0-9_.]+$")
@@ -692,6 +698,88 @@ def _bundled_ld_path(usr):
 
 ATL_XDG_DIR = os.path.join(DATA_DIR, "atl-xdg")
 
+# Android native libraries list bionic names as dependencies (libm.so, libc.so, libdl.so). Facebook's SoLoader,
+# which Instagram uses, resolves those by looking for a FILE with that name in LD_LIBRARY_PATH. glibc only ships
+# libm.so.6 etc., so the lookup fails ("couldn't find DSO to load: libm.so"). These symlinks give it something to find.
+COMPAT_LIB_DIR = os.path.join(DATA_DIR, "compat-lib")
+COMPAT_LIBS = {"libm.so": "libm.so.6", "libc.so": "libc.so.6", "libdl.so": "libdl.so.2",
+               # zlib: Android apps ask for libz.so, Ubuntu only ships libz.so.1 (the shim logs "library 'libz.so' not found")
+               "libz.so": "libz.so.1"}
+# Android's NDK media API (AMediaCodec, AMediaFormat...) lives in libmediandk.so, ATL implements it inside libandroid.so.
+# Native libraries of apps such as Spotify list libmediandk.so as a dependency, so give it an alias to ATL's libandroid.so.
+COMPAT_ALIASES = {"libmediandk.so": "libandroid.so"}
+
+
+def _mapped_lib_dirs():
+    """Folders of the libc/libm this very process has loaded (from /proc/self/maps). Needs no directory listing."""
+    found = []
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                parts = line.split(None, 5)
+                if len(parts) < 6:
+                    continue
+                path = parts[5].strip()
+                if os.path.basename(path).startswith(("libc.so", "libc-", "libm.so", "libm-")):
+                    d = os.path.dirname(path)
+                    if d not in found:
+                        found.append(d)
+    except OSError:
+        pass
+    return found
+
+
+def _glibc_dirs():
+    """Where glibc lives. A confined app may not be allowed to list /lib, so well-known paths are tested one by one
+    (stat) and the folders this process has already loaded libc from are added; glob is only a last resort."""
+    triplets = {platform.machine() + "-linux-gnu", "aarch64-linux-gnu"}
+    candidates = []
+    for t in sorted(triplets):
+        candidates += ["/lib/" + t, "/usr/lib/" + t]
+    candidates += ["/lib64", "/usr/lib64", "/lib", "/usr/lib"]
+    candidates += _mapped_lib_dirs()
+    for pattern in ("/lib/*-linux-gnu", "/usr/lib/*-linux-gnu"):
+        candidates += sorted(glob.glob(pattern))
+    found = []
+    for d in candidates:
+        if d not in found and os.path.isdir(d):
+            found.append(d)
+    return found
+
+
+def _ensure_compat_libs(existing_dirs):
+    """Creates the bionic-name symlinks that are not already provided by one of existing_dirs.
+    Returns the folder to add to LD_LIBRARY_PATH, or None if nothing is needed."""
+    needed = {}
+    for name, target in COMPAT_LIBS.items():
+        if any(os.path.exists(os.path.join(d, name)) for d in existing_dirs):
+            continue
+        for d in _glibc_dirs():
+            if os.path.exists(os.path.join(d, target)):
+                needed[name] = os.path.join(d, target)
+                break
+    for name, target in COMPAT_ALIASES.items():
+        if any(os.path.exists(os.path.join(d, name)) for d in existing_dirs):
+            continue
+        for d in existing_dirs:
+            if os.path.exists(os.path.join(d, target)):
+                needed[name] = os.path.join(d, target)
+                break
+    if not needed:
+        return None
+    try:
+        os.makedirs(COMPAT_LIB_DIR, exist_ok=True)
+        for name, target in needed.items():
+            link = os.path.join(COMPAT_LIB_DIR, name)
+            if os.path.islink(link) and os.readlink(link) == target:
+                continue
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(target, link)
+    except OSError:
+        return None
+    return COMPAT_LIB_DIR
+
 
 def _launch_env(cmd):
     env = dict(os.environ)
@@ -710,6 +798,9 @@ def _launch_env(cmd):
         dirs = _bundled_ld_path(usr)
     if os.path.isdir(EXTRA_LIB_DIR):
         dirs.append(EXTRA_LIB_DIR)
+    compat = _ensure_compat_libs(dirs + [d for d in env.get("LD_LIBRARY_PATH", "").split(":") if d])
+    if compat:
+        dirs.append(compat)
     if dirs:
         if env.get("LD_LIBRARY_PATH"):
             dirs.append(env["LD_LIBRARY_PATH"])
@@ -959,14 +1050,312 @@ def _ensure_libs(cmd, max_rounds=8):
     return None
 
 
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _parse_extra_env(text):
+    """'A=1 B="x y"' -> {'A': '1', 'B': 'x y'}. Invalid entries are ignored."""
+    result = {}
+    try:
+        parts = shlex.split(text or "")
+    except ValueError:
+        return result
+    for part in parts:
+        name, sep, value = part.partition("=")
+        if sep and ENV_NAME_RE.match(name):
+            result[name] = value
+    return result
+
+
+def _lib_diag(env):
+    """One line per bionic base library: where the loader could find it, and the compat symlinks."""
+    dirs = [d for d in env.get("LD_LIBRARY_PATH", "").split(":") if d]
+    lines = []
+    for name in ("libm.so", "libc.so", "libdl.so", "libz.so", "liblog.so"):
+        where = [d for d in dirs if os.path.lexists(os.path.join(d, name))]
+        lines.append("%s -> %s" % (name, ", ".join(where) if where else "NOT in LD_LIBRARY_PATH"))
+    compat = []
+    try:
+        for n in sorted(os.listdir(COMPAT_LIB_DIR)):
+            link = os.path.join(COMPAT_LIB_DIR, n)
+            compat.append("%s => %s%s" % (n, os.readlink(link) if os.path.islink(link) else "?",
+                                           "" if os.path.exists(link) else " (BROKEN)"))
+    except OSError:
+        compat.append("(no compat-lib folder)")
+    lines.append("compat-lib: " + "; ".join(compat))
+    lines.append("compat dir in LD_LIBRARY_PATH: %s" % (COMPAT_LIB_DIR in dirs))
+    lines.append("glibc dirs: %s" % ", ".join(_glibc_dirs()))
+    return lines
+
+
+def _apk_abi_summary(apk_path):
+    """Which CPU architectures the APK ships native libraries for, and where its libgnustl_shared.so is."""
+    try:
+        with zipfile.ZipFile(apk_path) as apk:
+            names = apk.namelist()
+    except (OSError, zipfile.BadZipFile) as exc:
+        return ["APK native libs: cannot read (%s)" % exc]
+    counts = {}
+    for n in names:
+        parts = n.split("/")
+        if len(parts) >= 3 and parts[0] == "lib" and n.endswith(".so"):
+            counts[parts[1]] = counts.get(parts[1], 0) + 1
+    if not counts:
+        return ["APK native libs: none (pure Java/Kotlin)"]
+    gnustl = sorted(n.split("/")[1] for n in names if n.endswith("/libgnustl_shared.so") and n.startswith("lib/"))
+    return ["APK native libs: " + ", ".join("%s=%d files" % (a, c) for a, c in sorted(counts.items())),
+            "device runs: %s (a 64-bit process cannot load 32-bit armeabi-v7a/armeabi/x86 libraries)" % ", ".join(device_abis()),
+            "libgnustl_shared.so is in: %s" % (", ".join(gnustl) or "-")]
+
+
+def _abi_hint(apk_path):
+    """Plain-language reason when the APK ships native code, but none for this device's CPU architecture."""
+    try:
+        with zipfile.ZipFile(apk_path) as apk:
+            abis = sorted({n.split("/")[1] for n in apk.namelist()
+                           if n.startswith("lib/") and n.endswith(".so") and n.count("/") >= 2})
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    if abis and not any(a in abis for a in device_abis()):
+        return ("This APK only has native code for %s, but this device needs %s. "
+                "Get the %s build of the app." % (
+                    ", ".join(abis), ", ".join(device_abis()), " / ".join(device_abis())))
+    return ""
+
+
+def _launch_log_path(pkg_id):
+    return os.path.join(CACHE_DIR, "launch_%s.log" % pkg_id)
+
+
+def _tail(path, lines):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return "".join(f.readlines()[-lines:]).strip()
+    except OSError:
+        return ""
+
+
+def _describe_exit(code):
+    if code is None:
+        return "still running"
+    if code < 0:
+        try:
+            return "killed by signal %s (%s)" % (-code, signal.Signals(-code).name)
+        except ValueError:
+            return "killed by signal %s" % -code
+    return "code %s" % code
+
+
+LOG_NOISE = ("jit_logger.cc", "hidden_api.cc", "I/SystemProperties")
+
+# Lines with these words are the ones that explain a crash: never cut them short
+_IMPORTANT_RE = re.compile(r"Exception|Error|FATAL|dlopen|cannot open shared|undefined symbol|System\.exit")
+_THREAD_HEADER_RE = re.compile(r'^"[^"]+" (?:daemon )?prio=\d+ tid=\d+ (\w+)')
+_DUMP_DETAIL = ("  | ", "  kernel:", "  native:", "  at ", "  - ")
+
+# (kind, pattern, what it means). The first line of the log that matches any of them is taken as the cause,
+# because everything after it (thread dumps, System.exit) is only the consequence.
+_CAUSES = (
+    ("native", re.compile(r"UnsatisfiedLinkError|dlopen failed|cannot open shared object file|undefined symbol"
+                          r"|library [\"'][^\"']+[\"'] not found|error while loading shared libraries"),
+     "A native library could not be loaded (a missing library or symbol). If it is a system library, bundle it "
+     "(tools/fetch_libs.py). If it is one of the .so files inside the APK, the app's native code does not work "
+     "with ATL and the store cannot fix that."),
+    ("gms", re.compile(r"(?:Exception|Error).*(?:google[./]android[./]gms|GoogleApiAvailability|google[./]firebase)"
+                       r"|(?:google[./]android[./]gms|GoogleApiAvailability).*(?:Exception|Error)"),
+     "The app needs Google Play Services, which ATL does not provide. Apps that depend on it usually do not work."),
+    ("api", re.compile(r"NoSuchMethodError|NoSuchFieldError|AbstractMethodError|NoClassDefFoundError"
+                       r"|ClassNotFoundException|UnsupportedOperationException"),
+     "The app uses an Android class or method that ATL does not implement (yet). A newer ATL SDK may help; "
+     "otherwise report this exact line to the ATL developers."),
+    ("security", re.compile(r"SecurityException"),
+     "The app was denied something. Check the AppArmor policy groups of the store."),
+    ("exception", re.compile(r"FATAL EXCEPTION|Exception in thread|^\s*Caused by:"
+                             r"|(?<![\w.$])(?:[a-z][\w]*\.)+[A-Z]\w*(?:Exception|Error)\b"),
+     "The app crashed with a Java exception. The first line is the cause; the lines after it show where."),
+)
+_MISSING_LIB_RE = re.compile(r"shim bionic linker: library ['\"]([^'\"]+)['\"] not found")
+_EXIT_RE = re.compile(r"System\.exit called, status: (-?\d+)")
+_FATAL_RE = re.compile(r"FATAL EXCEPTION|Exception in thread")
+
+
+def _collapse_thread_dumps(lines):
+    """ART prints a dump of every thread when an app aborts: hundreds of native frames that push the real error
+    out of view. Keeps only the Java frames of the threads that were running (Runnable/Native), drops the rest.
+    Returns (lines, number of threads, number of lines removed)."""
+    out = []
+    threads = removed = 0
+    in_thread = keep = False
+    for line in lines:
+        m = _THREAD_HEADER_RE.match(line)
+        if m:
+            if threads == 0:
+                out.append(None)  # placeholder for the note, filled below
+            threads += 1
+            in_thread = True
+            keep = m.group(1) in ("Runnable", "Native")
+            if keep:
+                out.append(line)
+            else:
+                removed += 1
+            continue
+        if in_thread and line.startswith(_DUMP_DETAIL):
+            if keep and line.startswith(("  at ", "  - ")):
+                out.append(line)
+            else:
+                removed += 1
+            continue
+        in_thread = False
+        out.append(line)
+    if threads:
+        i = out.index(None)
+        out[i] = "(thread dump collapsed: %d threads, %d lines hidden; only Runnable/Native threads are kept)" % (
+            threads, removed)
+    return out, threads, removed
+
+
+def _analyze_log(raw):
+    """Finds the cause of a crash in the whole log. Returns None if the log has nothing, else a dict with
+    kind, line (the cause), context (the lines after it), advice and exit_status (System.exit status or None)."""
+    lines, _, _ = _collapse_thread_dumps(raw)
+    lines = [l for l in lines if not any(n in l for n in LOG_NOISE)]
+    exit_status = None
+    for l in lines:
+        m = _EXIT_RE.search(l)
+        if m:
+            exit_status = int(m.group(1))
+            break
+    # a caught exception early in the log is not the cause: if the app says which one was fatal, start there.
+    # The marker line itself ("FATAL EXCEPTION: main") only says "something crashed", the line after it says what.
+    fatal = next((i for i, l in enumerate(lines) if _FATAL_RE.search(l)), None)
+    starts = [0] if fatal is None else [fatal + 1, fatal]
+    for start in starts:
+        for i in range(start, len(lines)):
+            l = lines[i]
+            if l.startswith("[atlstore]") or l.startswith("  at "):
+                continue
+            for kind, regex, advice in _CAUSES:
+                if regex.search(l):
+                    ctx = [c for c in lines[i + 1:i + 7] if not c.startswith("[atlstore]")]
+                    return {"kind": kind, "line": l.strip(), "context": ctx, "advice": advice,
+                            "exit_status": exit_status}
+    if exit_status is not None:
+        return {"kind": "exit", "line": "System.exit(%d) called by the app" % exit_status, "context": [],
+                "advice": "No exception appears in the log: the app closed itself. Apps usually do this when a startup "
+                          "check fails (Play Services, integrity or root check, native initialisation). Look at "
+                          "the lines just before the thread dump.",
+                "exit_status": exit_status}
+    return None
+
+
+def _cause_text(raw, width=300):
+    cause = _analyze_log(raw)
+    if not cause:
+        return ""
+    out = ["Cause (%s): %s" % (cause["kind"], cause["line"][:width])]
+    out += ["    " + c.strip()[:width] for c in cause["context"][:4]]
+    out.append("What it means: " + cause["advice"])
+    missing = []
+    for l in raw:
+        for m in _MISSING_LIB_RE.finditer(l):
+            if m.group(1) not in missing:
+                missing.append(m.group(1))
+    if missing:
+        out.append("Libraries the bionic shim could not find: " + ", ".join(missing[:8]))
+    if cause["exit_status"] is not None and cause["kind"] != "exit":
+        out.append("The app then ended with System.exit(%d)." % cause["exit_status"])
+    return "\n".join(out)
+
+
+def _read_log_lines(pkg_id):
+    if not PKG_RE.match(pkg_id or ""):
+        return []
+    try:
+        with open(_launch_log_path(pkg_id), "r", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def get_launch_summary(pkg_id):
+    """Short explanation of why the last launch of this app ended, searched in the WHOLE log (empty if unknown)."""
+    return _cause_text(_read_log_lines(pkg_id))
+
+
+def get_launch_log(pkg_id, lines=200, max_width=300, newest_first=False, hide_noise=True):
+    """Last lines of the log of the most recent launch of this app.
+
+    Harmless ART noise (hundreds of jit_logger lines) and thread dumps are dropped first so they cannot push the
+    real error out of view, lines longer than max_width are cut (except the ones that explain an error), and with
+    newest_first the end of the log comes first."""
+    raw = _read_log_lines(pkg_id)
+    if not raw:
+        return ""
+    if hide_noise:
+        raw = _collapse_thread_dumps(raw)[0]
+    hidden = 0
+    kept = []
+    for line in raw:
+        if hide_noise and any(n in line for n in LOG_NOISE):
+            hidden += 1
+            continue
+        if max_width and len(line) > max_width and not line.startswith("[atlstore]"):
+            limit = max(max_width, 2000) if _IMPORTANT_RE.search(line) else max_width
+            if len(line) > limit:
+                line = line[:limit] + " \u2026[+%d chars]" % (len(line) - limit)
+        kept.append(line)
+    kept = kept[-max(1, min(int(lines), 2000)):]
+    if newest_first:
+        kept.reverse()
+    if hidden:
+        note = "(%d harmless ART/system lines hidden)" % hidden
+        kept = ([note] if not newest_first else []) + kept + ([note] if newest_first else [])
+    return "\n".join(kept)
+
+
+def _watch_app(proc, pkg_id, log_path, started, apk_path=""):
+    """Waits for the app to end and tells the UI how, even if that happens long after the launch."""
+    code = proc.wait()
+    runtime = time.time() - started
+    try:
+        with open(log_path, "a") as log:
+            log.write("\n[atlstore] ended after %.1fs: %s\n" % (runtime, _describe_exit(code)))
+    except OSError:
+        pass
+    description = _describe_exit(code)
+    cause = None
+    if code:
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                raw_log = f.read().splitlines()
+            cause = _analyze_log(raw_log)
+            if cause:
+                with open(log_path, "a") as log:
+                    log.write("[atlstore] cause (%s): %s\n[atlstore] %s\n" % (
+                        cause["kind"], cause["line"][:300], cause["advice"]))
+                description += ". Cause: " + cause["line"][:120]
+        except OSError:
+            pass
+    hint = _abi_hint(apk_path) if code else ""
+    if hint:
+        description += ". " + hint
+        try:
+            with open(log_path, "a") as log:
+                log.write("[atlstore] %s\n" % hint)
+        except OSError:
+            pass
+    pyotherside.send("app_exited", pkg_id, code, round(runtime, 1), description, _tail(log_path, 8))
+
+
 def launch(pkg_id):
     entry = _read_json(LIBRARY_FILE, {}).get(pkg_id)
     if not entry or not os.path.exists(entry["apk"]):
         return {"ok": False, "error": "The APK was not found, download it again"}
+    settings = get_settings()
     try:
-        cmd = shlex.split(get_settings()["atl_bin"]) + [entry["apk"]]
+        cmd = shlex.split(settings["atl_bin"]) + shlex.split(settings["extra_args"]) + [entry["apk"]]
     except ValueError as exc:
-        return {"ok": False, "error": "Invalid ATL command: %s" % exc}
+        return {"ok": False, "error": "Invalid ATL command or arguments: %s" % exc}
 
     if cmd[0] == ATL_NAME and not shutil.which(ATL_NAME):
         return {"ok": False, "needs_sdk": True, "error": "ATL is not installed"}
@@ -975,16 +1364,27 @@ def launch(pkg_id):
     if problem:
         return {"ok": False, "error": problem}
 
-    log_path = os.path.join(CACHE_DIR, "launch_%s.log" % pkg_id)
+    env = _launch_env(cmd)
+    extra_env = _parse_extra_env(settings["extra_env"])
+    env.update(extra_env)
+
+    log_path = _launch_log_path(pkg_id)
+    started = time.time()
     try:
         with open(log_path, "w") as log:
+            log.write("[atlstore] %s\n[atlstore] extra env: %s\n[atlstore] LD_LIBRARY_PATH=%s\n" % (
+                " ".join(shlex.quote(c) for c in cmd), extra_env or "-", env.get("LD_LIBRARY_PATH", "")))
+            for diag in _apk_abi_summary(entry["apk"]) + _lib_diag(env):
+                log.write("[atlstore] %s\n" % diag)
+            log.write("\n")
+            log.flush()
             proc = subprocess.Popen(
                 cmd,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
-                env=_launch_env(cmd),
+                env=env,
             )
     except FileNotFoundError:
         return {"ok": False, "error": "ATL not found (%s). Change it in Settings." % cmd[0]}
@@ -993,11 +1393,7 @@ def launch(pkg_id):
 
     time.sleep(1.5)  # if it exits right away, show the error
     if proc.poll() is not None and proc.returncode != 0:
-        try:
-            with open(log_path, "r", errors="replace") as f:
-                tail = "".join(f.readlines()[-6:]).strip()
-        except OSError:
-            tail = ""
+        tail = _tail(log_path, 6)
         if EXTRA_LIB_DIR in tail:
             shutil.rmtree(EXTRA_LIB_DIR, ignore_errors=True)  # probably an incompatible library: it will be downloaded again on the next attempt
         hint = ""
@@ -1006,5 +1402,14 @@ def launch(pkg_id):
             if missing:
                 hint = "\n\nMissing libraries: %s\nBundle them: python3 tools/fetch_libs.py %s" % (
                     ", ".join(missing), " ".join(missing))
-        return {"ok": False, "error": "ATL exited (code %s)\n%s%s" % (proc.returncode, tail, hint)}
+        abi_hint = _abi_hint(entry["apk"])
+        if abi_hint:
+            hint = "\n\n" + abi_hint + hint
+        cause = _cause_text(_read_log_lines(pkg_id))
+        if cause:
+            hint = "\n\n" + cause + hint
+        return {"ok": False, "error": "ATL exited (%s)\n%s%s" % (_describe_exit(proc.returncode), tail, hint)}
+
+    # Still running (or finished cleanly): keep watching, so a crash later on is not lost
+    threading.Thread(target=_watch_app, args=(proc, pkg_id, log_path, started, entry["apk"]), daemon=True).start()
     return {"ok": True, "error": ""}

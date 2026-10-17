@@ -17,6 +17,8 @@ Page {
             atlField.text = s.atl_bin;
             repoField.text = s.repo_url;
             catalogField.text = s.catalog_url;
+            envField.text = s.extra_env;
+            argsField.text = s.extra_args;
         });
         py.call("store.device_info", [], function(info) {
             infoLabel.text = "Architecture: " + info.machine
@@ -74,6 +76,29 @@ Page {
                 inputMethodHints: Qt.ImhUrlCharactersOnly | Qt.ImhNoPredictiveText
             }
 
+            Label {
+                x: units.gu(2)
+                text: "Diagnostics: extra environment variables for ATL"
+            }
+            TextField {
+                id: envField
+                x: units.gu(2)
+                width: parent.width - units.gu(4)
+                placeholderText: "e.g. G_MESSAGES_DEBUG=all"
+                inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+            }
+
+            Label {
+                x: units.gu(2)
+                text: "Diagnostics: extra ATL arguments"
+            }
+            TextField {
+                id: argsField
+                x: units.gu(2)
+                width: parent.width - units.gu(4)
+                inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+            }
+
             Button {
                 x: units.gu(2)
                 text: "Save"
@@ -82,7 +107,9 @@ Page {
                     py.call("store.set_settings", [{
                         atl_bin: atlField.text,
                         repo_url: repoField.text,
-                        catalog_url: catalogField.text
+                        catalog_url: catalogField.text,
+                        extra_env: envField.text,
+                        extra_args: argsField.text
                     }], function() {
                         page.pageStack.pop();
                     });

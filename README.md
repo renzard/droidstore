@@ -3,6 +3,38 @@
 An Android app store for Ubuntu Touch. It downloads APKs (from F-Droid or from your own catalog),
 verifies their sha256 and opens them through the Android Translation Layer (ATL).
 
+## One project: store + ATL
+
+This repository contains both the store and the Android Translation Layer itself:
+
+    atl/                     ATL source (from upstream android_translation_layer, GPL-3.0) - patch it here
+    tools/build_atl.sh       builds atl/ + its dependencies in an arm64 Ubuntu 24.04 container -> usr/
+    tools/build_atl_inner.sh the steps that run inside the container (wolfSSL, bionic_translation, art_standalone, ATL)
+    tools/Dockerfile.atl     the build environment
+
+`usr/` is where the store already looks first (bundled mode), so a build from source needs no download at runtime:
+
+    ./tools/build_all.sh            # = build_atl.sh + clickable build; needs Docker, first build is slow (qemu on x86)
+
+The result is self-contained: `build_atl.sh` also bundles every shared library ATL needs that the phone lacks
+(`tools/bundle_closure.py` -> `usr/lib/extra`), and the store never downloads anything when `usr/` is in the package.
+To keep the package small, list once the libraries the phone already has (one-time, on the phone) and rebuild:
+
+    ldconfig -p | awk '/=>/ {print $1}' | sort -u > tools/device-libs.txt
+
+Without that file everything except the C runtime and the graphics stack (EGL/GL/Wayland/Vulkan, which must come
+from the phone) is bundled. Not covered: files that GTK/WebKit load at runtime (pixbuf loaders, GSettings schemas,
+GStreamer plugins) are not found by ldd; if an app misses them, the log will say so.
+
+`tools/fetch_sdk.sh` (prebuilt SDK from atl-touch) still works as a shortcut when you don't want to compile ATL.
+The dependency versions are taken from upstream branches; pin them with WOLFSSL_REF, BIONIC_REF, ART_REF.
+The exact versions used end up in `usr/share/atl-build-info.txt`.
+
+**Status:** the merge and the build scripts have NOT been run yet (they were written without a build environment).
+Expect to fix package names or dependency versions on the first run.
+
+Licenses: the store is AGPL-3.0 (`LICENSE`), ATL is GPL-3.0 (`atl/LICENSE.txt`).
+
 ## What it does
 
 - Search an app catalog (F-Droid index-v2), filtered to the device architecture

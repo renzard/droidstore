@@ -2,3 +2,10 @@ clickable_minimum_required: 7.0.0
 builder: precompiled
 restrict_arch: arm64
 kill: qmlscene
+# the ATL source, the build scripts and the tests are not needed on the phone (usr/ is)
+ignore:
+  - atl
+  - tools
+  - tests
+  - build
+  - .git

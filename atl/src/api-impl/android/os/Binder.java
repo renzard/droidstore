@@ -1,0 +1,44 @@
+package android.os;
+
+import android.atl.ATLLoadedApp;
+import android.content.Context;
+
+public class Binder implements IBinder {
+
+	private String mDescriptor;
+	private IInterface mOwner;
+
+	public void attachInterface(IInterface owner, String descriptor) {
+		mOwner = owner;
+		mDescriptor = descriptor;
+	}
+
+	public String getInterfaceDescriptor() {
+		return mDescriptor;
+	}
+
+	public IInterface getOwner() {
+		return mOwner;
+	}
+
+	public static void flushPendingCommands() {}
+
+	public static long clearCallingIdentity() { return 0; }
+
+	public static void restoreCallingIdentity(long identityToken) {}
+
+	@Override
+	public IInterface queryLocalInterface(String descriptor) { return null; }
+
+	@Override
+	public boolean transact(int code, Parcel data, Parcel reply, int flags) { return false; }
+
+	public static int getCallingUid() { return ATLLoadedApp.getPrimaryApplication().pkg.applicationInfo.uid; }
+
+	public static int getCallingPid() { return 0; }
+
+	@Override
+	public boolean equals(Object obj) {
+		return obj instanceof Binder;
+	}
+}
