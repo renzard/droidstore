@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=DroidStore
+Comment=Android apps via Android Translation Layer
+Exec=qmlscene %u qml/Main.qml
+Icon=assets/logo.svg
+Terminal=false
+Type=Application
+X-Lomiri-Touch=true

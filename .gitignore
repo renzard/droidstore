@@ -1,0 +1,4 @@
+*.click
+__pycache__/
+build/
+usr/

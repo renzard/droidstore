@@ -1,0 +1,38 @@
+name: Build ATL + click
+
+# Builds the patched ATL (atl/) natively on an arm64 runner and packages the click.
+# Run it from the Actions tab ("Run workflow") or push to main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ATL into usr/ (native arm64, no qemu)
+        run: ./tools/build_atl.sh
+
+      - name: Upload usr/ (patched ATL)
+        uses: actions/upload-artifact@v4
+        with:
+          name: atl-usr
+          path: usr/
+
+      - name: Build click package
+        continue-on-error: true
+        run: |
+          pip install clickable-ut
+          clickable build --skip-review
+
+      - name: Upload click
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidstore-click
+          path: |
+            **/*.click
+          if-no-files-found: warn

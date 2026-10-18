@@ -1,0 +1,11 @@
+# Build environment for ATL: Ubuntu 24.04 (same base as Ubuntu Touch 24.04), arm64.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential python3 git ca-certificates curl pkg-config meson ninja-build autoconf automake libtool \
+    openjdk-8-jdk-headless \
+    libasound2-dev libavcodec-dev libswscale-dev libcap-dev libdrm-dev libglib2.0-dev libgtk-4-dev \
+    libgudev-1.0-dev libopenxr-dev libportal-dev libsqlite3-dev libwebkitgtk-6.0-dev libsecret-1-dev \
+    libvulkan-dev libwayland-dev wayland-protocols libegl-dev libgl-dev libfontconfig-dev libbsd-dev \
+    libwebp-dev liblz4-dev \
+ && rm -rf /var/lib/apt/lists/*
