@@ -8,4 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgudev-1.0-dev libopenxr-dev libportal-dev libsqlite3-dev libwebkitgtk-6.0-dev libsecret-1-dev \
     libvulkan-dev libwayland-dev wayland-protocols libegl-dev libgl-dev libfontconfig-dev libbsd-dev \
     libwebp-dev liblz4-dev \
+    libasound2-plugins libpulse0 libgtk-4-media-gstreamer \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    gstreamer1.0-pulseaudio \
  && rm -rf /var/lib/apt/lists/*
+# libasound2-plugins, libgtk-4-media-gstreamer and the gstreamer1.0-* packages are installed only so that
+# tools/build_atl_inner.sh can copy their plugins into usr/: ATL's sound (ALSA "pulse" plugin, GTK media backend,
+# GStreamer plugins) is loaded with dlopen at runtime, so without this step the click has no sound at all.

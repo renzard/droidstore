@@ -115,6 +115,12 @@ assert res["ok"], res
 time.sleep(0.3)
 assert "launched" in open(os.path.join(tmp, "launched.txt")).read()
 
+# a second tap while the app is still running must not start a second copy
+store._PROCS["org.pure"] = type("Alive", (), {"poll": staticmethod(lambda: None)})()
+dup = store.launch("org.pure")
+assert dup["ok"] and dup.get("already_running"), dup
+store._PROCS.clear()
+
 # missing ATL
 store.set_settings({"atl_bin": "/nonexistent/atl"})
 assert not store.launch("org.pure")["ok"]

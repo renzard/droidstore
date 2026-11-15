@@ -13,9 +13,51 @@ static jmethodID deleteSurroundingText;
 static jmethodID toString;
 
 static jobject connection;
+// Set while the keyboard is opened for a plain EditText (a GtkText that has no Java InputConnection).
+// Text from the keyboard is then written straight into that widget.
+static GtkEditable *target_editable;
+// TRUE once the IM context has been given a client widget (it needs a few Wayland cycles before it works).
+static gboolean osk_primed;
+
+static void editable_commit(const char *str)
+{
+	gint start, end;
+	if (gtk_editable_get_selection_bounds(target_editable, &start, &end))
+		gtk_editable_delete_text(target_editable, start, end);
+	gint pos = gtk_editable_get_position(target_editable);
+	gtk_editable_insert_text(target_editable, str, -1, &pos);
+	gtk_editable_set_position(target_editable, pos);
+}
+
+static void editable_retrieve_surrounding(GtkIMContext *context)
+{
+	const char *text = gtk_editable_get_text(target_editable);
+	gint pos = gtk_editable_get_position(target_editable);
+	gint byte_index = g_utf8_offset_to_pointer(text, pos) - text;
+	gtk_im_context_set_surrounding_with_selection(context, text, -1, byte_index, byte_index);
+}
+
+static void editable_delete_surrounding(gint offset, gint n_chars)
+{
+	gint length = g_utf8_strlen(gtk_editable_get_text(target_editable), -1);
+	gint start = gtk_editable_get_position(target_editable) + offset;
+	gint end = start + n_chars;
+	if (start < 0)
+		start = 0;
+	if (end > length)
+		end = length;
+	if (end > start)
+		gtk_editable_delete_text(target_editable, start, end);
+}
 
 static void commit_cb(GtkIMContext *context, gchar *str, gpointer user_data)
 {
+	if (target_editable) {
+		editable_commit(str);
+		return;
+	}
+	if (!connection)
+		return;
 	JNIEnv *env = get_jni_env();
 	(*env)->CallBooleanMethod(env, connection, commitText, _JSTRING(str), 1);
 	if ((*env)->ExceptionCheck(env))
@@ -24,6 +66,12 @@ static void commit_cb(GtkIMContext *context, gchar *str, gpointer user_data)
 
 static void retrieve_surrounding_cb(GtkIMContext *context, gpointer user_data)
 {
+	if (target_editable) {
+		editable_retrieve_surrounding(context);
+		return;
+	}
+	if (!connection)
+		return;
 	JNIEnv *env = get_jni_env();
 	jobject before = (*env)->CallObjectMethod(env, connection, getTextBeforeCursor, 100, 0);
 	if ((*env)->ExceptionCheck(env))
@@ -47,6 +95,12 @@ static void retrieve_surrounding_cb(GtkIMContext *context, gpointer user_data)
 
 static void delete_surrounding_cb(GtkIMContext *context, gint offset, gint n_chars, gpointer user_data)
 {
+	if (target_editable) {
+		editable_delete_surrounding(offset, n_chars);
+		return;
+	}
+	if (!connection)
+		return;
 	JNIEnv *env = get_jni_env();
 	(*env)->CallBooleanMethod(env, connection, deleteSurroundingText, -offset, offset + n_chars);
 	if ((*env)->ExceptionCheck(env))
@@ -159,13 +213,34 @@ JNIEXPORT jboolean JNICALL Java_android_view_inputmethod_InputMethodManager_nati
 	GtkIMContext *context = GTK_IM_CONTEXT(_PTR(context_ptr));
 	gtk_im_context_set_client_widget(context, widget);
 	if (new_connection) {
+		target_editable = NULL;
 		set_input_type(context, input_type);
 		if (connection)
 			_UNREF(connection);
 		else // GtkIMContext needs a few Wayland cycles to become functional after setting the initial client widget, so schedule a retry after 10ms.
 			g_timeout_add(10, activate_osk, context);
 		connection = _REF(new_connection);
+		osk_primed = TRUE;
 	}
+	gtk_im_context_focus_in(context);
+	return gtk_im_context_activate_osk(context, NULL);
+}
+
+// Keyboard for a plain EditText: the view has no Java InputConnection, so showSoftInput() used to do nothing.
+JNIEXPORT jboolean JNICALL Java_android_view_inputmethod_InputMethodManager_nativeShowSoftInputEditable(JNIEnv *env, jobject this, jlong context_ptr, jlong widget_ptr, jint input_type)
+{
+	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
+	GtkIMContext *context = GTK_IM_CONTEXT(_PTR(context_ptr));
+	if (!GTK_IS_EDITABLE(widget))
+		return JNI_FALSE;
+	gboolean first_time = !osk_primed;
+	osk_primed = TRUE;
+	target_editable = GTK_EDITABLE(widget);
+	gtk_widget_grab_focus(widget); // key events (backspace, enter) go to the focused widget
+	gtk_im_context_set_client_widget(context, widget);
+	set_input_type(context, input_type);
+	if (first_time)
+		g_timeout_add(10, activate_osk, context);
 	gtk_im_context_focus_in(context);
 	return gtk_im_context_activate_osk(context, NULL);
 }
@@ -173,5 +248,6 @@ JNIEXPORT jboolean JNICALL Java_android_view_inputmethod_InputMethodManager_nati
 JNIEXPORT void JNICALL Java_android_view_inputmethod_InputMethodManager_nativeHideSoftInput(JNIEnv *env, jobject this, jlong context_ptr)
 {
 	GtkIMContext *context = GTK_IM_CONTEXT(_PTR(context_ptr));
+	target_editable = NULL;
 	gtk_im_context_focus_out(context);
 }

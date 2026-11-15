@@ -19,6 +19,7 @@ Page {
             catalogField.text = s.catalog_url;
             envField.text = s.extra_env;
             argsField.text = s.extra_args;
+            shortcutSwitch.checked = s.launcher_shortcuts !== "0";
         });
         py.call("store.device_info", [], function(info) {
             infoLabel.text = "Architecture: " + info.machine
@@ -99,6 +100,43 @@ Page {
                 inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
             }
 
+            Row {
+                x: units.gu(2)
+                width: parent.width - units.gu(4)
+                spacing: units.gu(2)
+                Label {
+                    id: shortcutLabel
+                    width: parent.width - shortcutSwitch.width - units.gu(2)
+                    anchors.verticalCenter: parent.verticalCenter
+                    wrapMode: Text.WordWrap
+                    text: "Show installed apps in the app drawer (like normal apps)"
+                }
+                Switch {
+                    id: shortcutSwitch
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+            Button {
+                x: units.gu(2)
+                text: "Update app drawer now"
+                onClicked: {
+                    py.call("store.set_settings", [{launcher_shortcuts: shortcutSwitch.checked ? "1" : "0"}], function() {
+                        py.call("store.sync_shortcuts", [], function(r) {
+                            shortcutInfo.text = r.ok
+                                ? "App drawer updated: " + r.created + " added, " + r.removed + " removed."
+                                : r.error;
+                        });
+                    });
+                }
+            }
+            Label {
+                id: shortcutInfo
+                x: units.gu(2)
+                width: parent.width - units.gu(4)
+                wrapMode: Text.WordWrap
+                fontSize: "small"
+            }
+
             Button {
                 x: units.gu(2)
                 text: "Save"
@@ -109,7 +147,8 @@ Page {
                         repo_url: repoField.text,
                         catalog_url: catalogField.text,
                         extra_env: envField.text,
-                        extra_args: argsField.text
+                        extra_args: argsField.text,
+                        launcher_shortcuts: shortcutSwitch.checked ? "1" : "0"
                     }], function() {
                         page.pageStack.pop();
                     });

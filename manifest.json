@@ -9,7 +9,7 @@
             "desktop": "droidstore.desktop"
         }
     },
-    "version": "0.2.0",
+    "version": "0.2.9",
     "maintainer": "renz21 <renzardpolitakis@gmail.com>",
     "framework": "ubuntu-sdk-20.04"
 }

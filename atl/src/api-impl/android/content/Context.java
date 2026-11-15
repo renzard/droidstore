@@ -281,21 +281,49 @@ public abstract class Context {
 		return new File[] {getObbDir()};
 	}
 
+	// true if dir exists (or can be created) and a file can really be created in it.
+	// File.canWrite() is access(2), which AppArmor does not check: a cache folder that an earlier unconfined run left in
+	// /tmp looks writable, but every open() in it is denied (DuckDuckGo's log: "FileNotFoundException: .../app.db.lck
+	// (Permission denied)"). Creating a file is the only test that gives the real answer.
+	private static boolean isUsableDir(File dir) {
+		// the second isDirectory() is for a spurious mkdirs() failure; probably racing with another process for this app
+		if (!(dir.isDirectory() || dir.mkdirs() || dir.isDirectory())) {
+			return false;
+		}
+		File probe = new File(dir, ".atl_write_probe");
+		try {
+			new java.io.FileOutputStream(probe).close();
+		} catch (java.io.IOException e) {
+			return false;
+		}
+		probe.delete();
+		return true;
+	}
+
 	public File getCacheDir() {
-		if (cache_dir == null) {
-			cache_dir = new File("/tmp/atl_cache/" + getPackageName());
-		}
-		if (!cache_dir.exists()) {
-			if (!cache_dir.mkdirs()) {
-				if (cache_dir.exists()) {
-					// spurious failure; probably racing with another process for this app
-					return cache_dir;
-				}
-				Slog.w(TAG, "Unable to create cache directory >" + cache_dir.getPath() + "<");
-				return null;
+		if (cache_dir != null) {
+			// it was tested when it was chosen, and apps ask for it very often: only make it again if it was deleted
+			if (cache_dir.isDirectory() || cache_dir.mkdirs() || cache_dir.isDirectory()) {
+				return cache_dir;
 			}
+			cache_dir = null;
 		}
-		return cache_dir;
+		// The default place is /tmp/atl_cache/<package>. When ATL runs confined (AppArmor, e.g. started by the DroidStore
+		// click) /tmp is not writable, this used to return null and apps crashed on it (Chaquopy/Python: "Permission
+		// denied: 'None'", because str(getCacheDir()) became the folder name "None"). So fall back to a folder inside the
+		// app's own data directory, which is where Android keeps the cache anyway and which is always writable.
+		File[] candidates = {
+			new File("/tmp/atl_cache/" + getPackageName()),
+			new File(getDataDirFile(), "cache"),
+		};
+		for (File candidate : candidates) {
+			if (isUsableDir(candidate)) {
+				cache_dir = candidate;
+				return cache_dir;
+			}
+			Slog.w(TAG, "Unable to create cache directory >" + candidate.getPath() + "<");
+		}
+		return null;
 	}
 
 	public File getExternalCacheDir() {

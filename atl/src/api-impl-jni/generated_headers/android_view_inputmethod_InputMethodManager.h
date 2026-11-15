@@ -25,6 +25,14 @@ JNIEXPORT jboolean JNICALL Java_android_view_inputmethod_InputMethodManager_nati
 
 /*
  * Class:     android_view_inputmethod_InputMethodManager
+ * Method:    nativeShowSoftInputEditable
+ * Signature: (JJI)Z
+ */
+JNIEXPORT jboolean JNICALL Java_android_view_inputmethod_InputMethodManager_nativeShowSoftInputEditable
+  (JNIEnv *, jobject, jlong, jlong, jint);
+
+/*
+ * Class:     android_view_inputmethod_InputMethodManager
  * Method:    nativeHideSoftInput
  * Signature: (J)V
  */

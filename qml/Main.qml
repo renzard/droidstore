@@ -1,6 +1,7 @@
 import QtQuick 2.12
 import Lomiri.Components 1.3
 import io.thp.pyotherside 1.4
+import "."
 
 MainView {
     id: root
@@ -25,9 +26,38 @@ MainView {
     property bool storeHasMore: false   // the last page was full: there may be more apps
     property bool storeLoading: false
     property int searchToken: 0         // ignores answers that belong to an older search
+    property bool compatOnly: false     // "No native code" filter chip
+    property string searchCategory: ""  // active category filter
+    property string searchSort: ""      // "", "new" or "updated" (Discover's "see all")
+    property int tab: 0                 // 0 Discover, 1 Search, 2 My apps
+    property var searchHistory: []
+    property bool discoverLoaded: false
+    property int totalApps: 0
+    property bool menuOpen: false
+    property bool toastDismissed: false
+    property string toastText: ""
+    readonly property bool browsing: searchField.text === "" && searchCategory === "" && searchSort === ""
+
+    onStatusTextChanged: {
+        if (statusText !== "") {
+            toastText = statusText;
+        }
+        toastDismissed = false;
+        toastTimer.restart();
+    }
+    onTabChanged: {
+        menuOpen = false;
+        if (tab !== 1) {
+            searchField.focus = false;
+        }
+    }
 
     ListModel { id: storeModel }
     ListModel { id: libraryModel }
+    ListModel { id: newModel }
+    ListModel { id: updatedModel }
+    ListModel { id: verifiedModel }
+    ListModel { id: categoryModel }
 
     // ---------- backend ----------
     Python {
@@ -43,6 +73,13 @@ MainView {
                 root.updateItem(pkg, { busy: false, installed: true, updateAvailable: false, newVersion: "", progress: 0 });
                 root.refreshLibrary();
                 root.statusText = "Installation complete";
+                call("store.add_shortcut", [pkg], function(r) {
+                    if (!r.ok && r.error.indexOf("turned off") < 0 && r.error.indexOf("not allowed") < 0)
+                        root.statusText = "Installed, but not added to the app drawer: " + r.error;
+                });
+            });
+            setHandler("shortcuts_synced", function(ok, created, removed, error) {
+                if (!ok && error.indexOf("not allowed") < 0) root.statusText = "App drawer: " + error;
             });
             setHandler("failed", function(pkg, message) {
                 root.updateItem(pkg, { busy: false, progress: 0 });
@@ -55,6 +92,7 @@ MainView {
                 root.catalogBusy = false;
                 root.statusText = count + " apps in the catalog";
                 root.doSearch();
+                root.loadDiscover();
                 root.refreshLibrary();  // new catalog: the update badges may change
             });
             setHandler("catalog_error", function(message) {
@@ -99,11 +137,14 @@ MainView {
                 call("store.has_catalog", [], function(has) {
                     if (has) {
                         root.doSearch();
+                        root.loadDiscover();
                     } else {
                         root.updateCatalog();
                     }
                 });
                 root.refreshLibrary();
+                root.loadHistory();
+                call("store.sync_shortcuts_async", []);
             });
         }
 
@@ -123,10 +164,108 @@ MainView {
         }
     }
 
+    // Brings a model in line with a new list WITHOUT clearing it: rows that stay are updated in place,
+    // so list animations only play for rows that really appear or disappear.
+    function syncModel(model, items) {
+        var ids = {};
+        var i, j, k;
+        for (i = 0; i < items.length; i++) {
+            ids[items[i].pkgId] = true;
+        }
+        for (i = model.count - 1; i >= 0; i--) {
+            if (!ids[model.get(i).pkgId]) {
+                model.remove(i);
+            }
+        }
+        for (i = 0; i < items.length; i++) {
+            if (i < model.count && model.get(i).pkgId === items[i].pkgId) {
+                for (k in items[i]) {
+                    model.setProperty(i, k, items[i][k]);
+                }
+                continue;
+            }
+            var found = -1;
+            for (j = i + 1; j < model.count; j++) {
+                if (model.get(j).pkgId === items[i].pkgId) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                model.move(found, i, 1);
+                for (k in items[i]) {
+                    model.setProperty(i, k, items[i][k]);
+                }
+            } else {
+                model.insert(i, items[i]);
+            }
+        }
+    }
+
+    function loadDiscover() {
+        py.call("store.discover", [12], function(d) {
+            syncModel(newModel, d["new"]);
+            syncModel(updatedModel, d["updated"]);
+            syncModel(verifiedModel, d["verified"]);
+            var cats = [];
+            for (var c = 0; c < d["categories"].length; c++) {
+                cats.push({ name: d["categories"][c].name, apps: d["categories"][c].count });
+            }
+            fillModel(categoryModel, cats);
+            root.totalApps = d["total"];
+            root.discoverLoaded = true;
+        });
+    }
+
+    function loadHistory() {
+        py.call("store.get_search_history", [], function(h) { root.searchHistory = h; });
+    }
+
+    function addHistory(query) {
+        if ((query || "").trim().length < 2) {
+            return;
+        }
+        py.call("store.add_search_history", [query], function(h) { root.searchHistory = h; });
+    }
+
+    function clearHistory() {
+        py.call("store.clear_search_history", [], function(h) { root.searchHistory = h; });
+    }
+
+    function openCategory(name) {
+        searchCategory = name;
+        searchSort = "";
+        tab = 1;
+        doSearch();
+    }
+
+    function openSort(mode) {
+        searchSort = mode;
+        searchCategory = "";
+        tab = 1;
+        doSearch();
+    }
+
+    function setCategory(name) {
+        searchCategory = name;
+        doSearch();
+    }
+
+    function setSort(mode) {
+        searchSort = mode;
+        doSearch();
+    }
+
     function doSearch() {
         var token = ++searchToken;
+        if (browsing) {  // nothing typed, no filter: the Search tab shows history + categories instead
+            storeModel.clear();
+            storeHasMore = false;
+            storeLoading = false;
+            return;
+        }
         storeLoading = true;
-        py.call("store.search", [searchField.text, pureOnly.checked, pageSize, 0], function(items) {
+        py.call("store.search", [searchField.text, compatOnly, pageSize, 0, searchCategory, searchSort], function(items) {
             if (token !== root.searchToken) {
                 return;
             }
@@ -138,12 +277,12 @@ MainView {
 
     // next page of the same search, when the end of the list is reached
     function loadMore() {
-        if (!storeHasMore || storeLoading) {
+        if (!storeHasMore || storeLoading || browsing) {
             return;
         }
         var token = searchToken;
         storeLoading = true;
-        py.call("store.search", [searchField.text, pureOnly.checked, pageSize, storeModel.count], function(items) {
+        py.call("store.search", [searchField.text, compatOnly, pageSize, storeModel.count, searchCategory, searchSort], function(items) {
             if (token !== root.searchToken) {
                 return;
             }
@@ -157,7 +296,7 @@ MainView {
 
     function refreshLibrary() {
         py.call("store.list_installed", [], function(items) {
-            fillModel(libraryModel, items);
+            syncModel(libraryModel, items);
             var n = 0;
             for (var i = 0; i < items.length; i++) {
                 if (items[i].updateAvailable) {
@@ -180,7 +319,7 @@ MainView {
     }
 
     function updateItem(pkg, props) {
-        var models = [storeModel, libraryModel];
+        var models = [storeModel, libraryModel, newModel, updatedModel, verifiedModel];
         for (var m = 0; m < models.length; m++) {
             for (var i = 0; i < models[m].count; i++) {
                 if (models[m].get(i).pkgId === pkg) {
@@ -193,6 +332,10 @@ MainView {
         if (detailsPage && detailsPage.pkgId === pkg) {
             detailsPage.applyProps(props);
         }
+    }
+
+    function goBack() {
+        stack.pop();
     }
 
     function openDetails(pkg) {
@@ -236,6 +379,13 @@ MainView {
         });
     }
 
+    function addToDrawer(pkg) {
+        py.call("store.add_shortcut", [pkg, true], function(r) {
+            statusText = r.ok ? "Added to the app drawer. Swipe up from the left edge / open the app list to find it."
+                              : "App drawer: " + r.error;
+        });
+    }
+
     function removeApp(pkg) {
         py.call("store.remove", [pkg], function() {
             updateItem(pkg, { installed: false });
@@ -244,6 +394,25 @@ MainView {
     }
 
     // ---------- UI ----------
+    // follow the system theme (dark/light) for all custom components
+    Binding {
+        target: Pal
+        property: "dark"
+        value: theme.palette.normal.background.hslLightness < 0.5
+    }
+
+    Timer {
+        id: toastTimer
+        interval: 8000
+        onTriggered: root.toastDismissed = true
+    }
+
+    Timer {
+        id: searchTimer
+        interval: 350
+        onTriggered: root.doSearch()
+    }
+
     PageStack {
         id: stack
         Component.onCompleted: push(mainPage)
@@ -251,281 +420,793 @@ MainView {
         Page {
             id: mainPage
             visible: false
+            header: PageHeader { visible: false }
 
-            header: PageHeader {
-                id: header
-                title: "DroidStore"
-
-                trailingActionBar.actions: [
-                    Action {
-                        iconName: "add"
-                        text: "Add APK"
-                        onTriggered: stack.push(Qt.resolvedUrl("ImportPage.qml"), { appRoot: root, py: py })
-                    },
-                    Action {
-                        iconName: "reload"
-                        text: "Refresh catalog"
-                        enabled: !root.catalogBusy
-                        onTriggered: root.updateCatalog()
-                    },
-                    Action {
-                        iconName: "document-open"
-                        text: "Last log"
-                        enabled: root.lastRunPkg !== ""
-                        onTriggered: stack.push(Qt.resolvedUrl("LogPage.qml"), { py: py, pkgId: root.lastRunPkg })
-                    },
-                    Action {
-                        iconName: "settings"
-                        text: "Settings"
-                        onTriggered: stack.push(Qt.resolvedUrl("SettingsPage.qml"), { py: py })
-                    }
-                ]
-
-                extension: Sections {
-                    id: sections
-                    anchors {
-                        left: parent.left
-                        leftMargin: units.gu(2)
-                        bottom: parent.bottom
-                    }
-                    model: ["Store", "Installed"]
+            function menuAction(id) {
+                if (id === "add") {
+                    stack.push(Qt.resolvedUrl("ImportPage.qml"), { appRoot: root, py: py });
+                } else if (id === "log") {
+                    stack.push(Qt.resolvedUrl("LogPage.qml"), { py: py, pkgId: root.lastRunPkg });
+                } else if (id === "settings") {
+                    stack.push(Qt.resolvedUrl("SettingsPage.qml"), { py: py });
                 }
             }
 
-            // status line + ATL message
-            Column {
-                id: topInfo
-                anchors {
-                    top: header.bottom
-                    left: parent.left
-                    right: parent.right
-                    margins: units.gu(1)
-                }
-                spacing: units.gu(1)
+            Rectangle { anchors.fill: parent; color: Pal.bg }
 
-                Label {
-                    id: statusLabel
-                    width: parent.width
-                    visible: text !== ""
-                    text: root.statusText
-                    wrapMode: Text.WordWrap
-                    fontSize: "small"
-                    color: theme.palette.normal.backgroundSecondaryText
-
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: root.lastRunPkg !== "" && statusLabel.text.indexOf("log") !== -1
-                        onClicked: stack.push(Qt.resolvedUrl("LogPage.qml"), { py: py, pkgId: root.lastRunPkg })
-                    }
-                }
-
-                Column {
-                    id: sdkBanner
-                    width: parent.width
-                    visible: root.sdkMissing || root.sdkBusy
-                    spacing: units.gu(1)
-
-                    Label {
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        text: root.sdkBusy
-                              ? (root.sdkPhase === "extract" ? "Extracting ATL… " : "Downloading ATL… ")
-                                + Math.round(root.sdkProgress * 100) + "%"
-                              : "ATL (about 50 MB) is needed to open apps."
-                    }
-                    ProgressBar {
-                        width: parent.width
-                        visible: root.sdkBusy
-                        minimumValue: 0
-                        maximumValue: 1
-                        value: root.sdkProgress
-                    }
-                    Button {
-                        visible: !root.sdkBusy
-                        text: "Install ATL"
-                        color: theme.palette.normal.positive
-                        onClicked: root.installSdk()
-                    }
-                }
-            }
-
-            // ----- Store -----
+            // =============== top bar ===============
             Item {
-                id: storeTab
-                visible: sections.selectedIndex === 0
-                anchors {
-                    top: topInfo.bottom
-                    left: parent.left
-                    right: parent.right
-                    bottom: parent.bottom
-                }
+                id: topBar
+                anchors { top: parent.top; left: parent.left; right: parent.right }
+                height: units.gu(8)
+                z: 5
 
-                TextField {
-                    id: searchField
-                    anchors {
-                        top: parent.top
-                        left: parent.left
-                        right: parent.right
-                        margins: units.gu(1)
-                    }
-                    placeholderText: "Search apps…"
-                    inputMethodHints: Qt.ImhNoPredictiveText
-                    onTextChanged: searchTimer.restart()
-                }
+                // title bar: Discover / My apps
+                Item {
+                    anchors.fill: parent
+                    opacity: root.tab === 1 ? 0 : 1
+                    visible: opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: Pal.med } }
 
-                Row {
-                    id: filterRow
-                    anchors {
-                        top: searchField.bottom
-                        left: parent.left
-                        margins: units.gu(1)
-                    }
-                    spacing: units.gu(1)
-
-                    CheckBox {
-                        id: pureOnly
-                        onCheckedChanged: root.doSearch()
-                    }
                     Label {
-                        anchors.verticalCenter: pureOnly.verticalCenter
-                        text: "Only without native code (more compatible)"
-                        fontSize: "small"
+                        anchors { left: parent.left; leftMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                        text: root.tab === 2 ? "My apps" : "DroidStore"
+                        font.pixelSize: units.gu(3.6)
+                        color: Pal.text
                     }
-                }
 
-                ListView {
-                    anchors {
-                        top: filterRow.bottom
-                        left: parent.left
-                        right: parent.right
-                        bottom: parent.bottom
-                        topMargin: units.gu(1)
-                    }
-                    clip: true
-                    model: storeModel
-                    cacheBuffer: units.gu(40)
-                    onAtYEndChanged: if (atYEnd) root.loadMore()
+                    Row {
+                        anchors { right: parent.right; rightMargin: units.gu(1); verticalCenter: parent.verticalCenter }
+                        spacing: units.gu(0.5)
 
-                    delegate: ListItem {
-                        height: units.gu(9)
-                        onClicked: root.openDetails(model.pkgId)
+                        Ripple {
+                            width: units.gu(5.6)
+                            height: width
+                            radius: width / 2
+                            enabled: !root.catalogBusy
+                            opacity: enabled ? 1 : 0.6
+                            onClicked: root.updateCatalog()
 
-                        ListItemLayout {
-                            title.text: model.name + (model.verified ? "  ✔" : "")
-                            subtitle.text: model.summary
-                            summary.text: model.version + (model.native ? " • native" : " • Java")
-
-                            Image {
-                                SlotsLayout.position: SlotsLayout.Leading
-                                width: units.gu(5)
+                            Icon {
+                                anchors.centerIn: parent
+                                width: units.gu(3)
                                 height: width
-                                source: model.icon
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
+                                name: "reload"
+                                color: Pal.text
+                                NumberAnimation on rotation {
+                                    from: 0
+                                    to: 360
+                                    duration: 900
+                                    loops: Animation.Infinite
+                                    running: root.catalogBusy
+                                    alwaysRunToEnd: true
+                                }
                             }
+                        }
 
-                            Button {
-                                SlotsLayout.position: SlotsLayout.Trailing
-                                width: units.gu(11)
-                                text: model.busy ? Math.round(model.progress * 100) + "%"
-                                      : (model.updateAvailable ? "Update"
-                                         : (model.installed ? "Open" : "Get"))
-                                enabled: !model.busy
-                                color: (model.installed && !model.updateAvailable)
-                                       ? theme.palette.normal.positive : theme.palette.normal.activity
-                                onClicked: (model.installed && !model.updateAvailable)
-                                           ? root.launchApp(model.pkgId) : root.installApp(model.pkgId)
+                        Ripple {
+                            width: units.gu(5.6)
+                            height: width
+                            radius: width / 2
+                            onClicked: root.menuOpen = !root.menuOpen
+
+                            Label {
+                                anchors.centerIn: parent
+                                text: "⋮"
+                                font.pixelSize: units.gu(3.2)
+                                color: Pal.text
                             }
                         }
                     }
+                }
 
-                    Label {
-                        anchors.centerIn: parent
-                        visible: storeModel.count === 0 && !root.catalogBusy
-                        text: "No apps found"
+                // search bar: Search tab
+                Item {
+                    anchors.fill: parent
+                    opacity: root.tab === 1 ? 1 : 0
+                    visible: opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: Pal.med } }
+
+                    Rectangle {
+                        id: searchPill
+                        anchors { left: parent.left; right: parent.right; leftMargin: units.gu(2); rightMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                        height: units.gu(5.8)
+                        radius: height / 2
+                        color: Pal.surface
+                        border.width: searchField.activeFocus ? units.dp(2) : 0
+                        border.color: Pal.primary
+                        Behavior on border.width { NumberAnimation { duration: Pal.fast } }
+
+                        MouseArea { anchors.fill: parent; onClicked: searchField.forceActiveFocus() }
+
+                        Icon {
+                            id: searchIcon
+                            anchors { left: parent.left; leftMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                            width: units.gu(2.6)
+                            height: width
+                            name: "search"
+                            color: searchField.activeFocus ? Pal.primary : Pal.textDim
+                        }
+
+                        Label {
+                            anchors { left: searchField.left; verticalCenter: parent.verticalCenter }
+                            text: "Search apps…"
+                            font.pixelSize: units.gu(2)
+                            color: Pal.textDim
+                            opacity: searchField.text === "" ? 1 : 0
+                            Behavior on opacity { NumberAnimation { duration: Pal.fast } }
+                        }
+
+                        TextInput {
+                            id: searchField
+                            anchors { left: searchIcon.right; leftMargin: units.gu(1.5); right: clearButton.left; verticalCenter: parent.verticalCenter }
+                            color: Pal.text
+                            font.pixelSize: units.gu(2)
+                            selectionColor: Pal.primary
+                            selectedTextColor: Pal.onPrimary
+                            clip: true
+                            inputMethodHints: Qt.ImhNoPredictiveText
+                            onTextChanged: searchTimer.restart()
+                            onAccepted: {
+                                root.addHistory(text);
+                                focus = false;
+                            }
+                        }
+
+                        Ripple {
+                            id: clearButton
+                            anchors { right: parent.right; rightMargin: units.gu(0.6); verticalCenter: parent.verticalCenter }
+                            width: units.gu(4.6)
+                            height: width
+                            radius: width / 2
+                            opacity: searchField.text === "" ? 0 : 1
+                            enabled: searchField.text !== ""
+                            Behavior on opacity { NumberAnimation { duration: Pal.fast } }
+                            onClicked: { searchField.text = ""; searchField.forceActiveFocus(); }
+
+                            Label {
+                                anchors.centerIn: parent
+                                text: "×"
+                                font.pixelSize: units.gu(3)
+                                color: Pal.textDim
+                            }
+                        }
                     }
                 }
             }
 
-            // ----- Installed -----
-            ListView {
-                id: libraryList
-                visible: sections.selectedIndex === 1
-                anchors {
-                    top: topInfo.bottom
-                    left: parent.left
-                    right: parent.right
-                    bottom: parent.bottom
-                }
+            // =============== ATL banner ===============
+            Item {
+                id: sdkWrap
+                anchors { top: topBar.bottom; left: parent.left; right: parent.right }
+                height: (root.sdkMissing || root.sdkBusy) ? sdkCard.height + units.gu(1) : 0
                 clip: true
-                model: libraryModel
+                z: 4
+                Behavior on height { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
 
-                header: Item {
-                    width: libraryList.width
-                    height: root.updatesCount > 0 ? units.gu(7) : 0
-                    visible: root.updatesCount > 0
+                Rectangle {
+                    id: sdkCard
+                    anchors { left: parent.left; right: parent.right; margins: units.gu(2) }
+                    height: sdkColumn.height + units.gu(3)
+                    radius: units.gu(1.5)
+                    color: Pal.surface
 
-                    Button {
-                        anchors.centerIn: parent
-                        text: "Update all (" + root.updatesCount + ")"
-                        color: theme.palette.normal.activity
-                        onClicked: root.updateAll()
+                    Column {
+                        id: sdkColumn
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: units.gu(1.5) }
+                        spacing: units.gu(1.2)
+
+                        Label {
+                            width: parent.width
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: units.gu(1.8)
+                            color: Pal.text
+                            text: root.sdkBusy
+                                  ? (root.sdkPhase === "extract" ? "Extracting ATL… " : "Downloading ATL… ")
+                                    + Math.round(root.sdkProgress * 100) + "%"
+                                  : "ATL (about 50 MB) is needed to open apps."
+                        }
+                        ProgressLine {
+                            width: parent.width
+                            visible: root.sdkBusy
+                            value: root.sdkProgress
+                        }
+                        ActionButton {
+                            visible: !root.sdkBusy
+                            label: "Install ATL"
+                            onClicked: root.installSdk()
+                        }
+                    }
+                }
+            }
+
+            // =============== tabs ===============
+            Item {
+                id: tabs
+                anchors { top: sdkWrap.bottom; left: parent.left; right: parent.right; bottom: nav.top }
+                clip: true
+
+                // ---------- Discover ----------
+                Item {
+                    id: discoverTab
+                    width: parent.width   // (no anchors: x is animated)
+                    height: parent.height
+                    opacity: root.tab === 0 ? 1 : 0
+                    visible: opacity > 0
+                    enabled: root.tab === 0
+                    x: root.tab === 0 ? 0 : -units.gu(5)
+                    Behavior on opacity { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+                    Behavior on x { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+
+                    Flickable {
+                        anchors.fill: parent
+                        contentHeight: discoverColumn.height + units.gu(3)
+                        clip: true
+
+                        Column {
+                            id: discoverColumn
+                            width: parent.width
+
+                            Reveal {
+                                order: 0
+                                active: root.discoverLoaded
+                                visible: newModel.count > 0
+                                SectionHeader { title: "New apps"; onArrowClicked: root.openSort("new") }
+                                HList { model: newModel; onAppClicked: root.openDetails(pkgId) }
+                            }
+
+                            Reveal {
+                                order: 1
+                                active: root.discoverLoaded
+                                visible: updatedModel.count > 0
+                                SectionHeader { title: "Recently updated"; onArrowClicked: root.openSort("updated") }
+                                HList { model: updatedModel; onAppClicked: root.openDetails(pkgId) }
+                            }
+
+                            Reveal {
+                                order: 2
+                                active: root.discoverLoaded
+                                visible: verifiedModel.count > 0
+                                SectionHeader { title: "Works with ATL"; showArrow: false }
+                                HList { model: verifiedModel; onAppClicked: root.openDetails(pkgId) }
+                            }
+
+                            Reveal {
+                                order: 3
+                                active: root.discoverLoaded
+                                visible: categoryModel.count > 0
+                                SectionHeader { title: "Categories"; showArrow: false }
+                                Item {
+                                    width: parent.width
+                                    height: categoryBox.height + units.gu(2)
+
+                                    Rectangle {
+                                        id: categoryBox
+                                        x: units.gu(2)
+                                        width: parent.width - units.gu(4)
+                                        height: categoryColumn.height
+                                        radius: units.gu(2.2)
+                                        color: "transparent"
+                                        border.width: units.dp(1)
+                                        border.color: Pal.outline
+                                        clip: true
+
+                                        Column {
+                                            id: categoryColumn
+                                            width: parent.width
+                                            Repeater {
+                                                model: categoryModel
+                                                delegate: CategoryRow {
+                                                    name: model.name
+                                                    count: model.apps
+                                                    divider: index < categoryModel.count - 1
+                                                    onClicked: root.openCategory(model.name)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Reveal {
+                                order: 4
+                                active: root.discoverLoaded
+                                Item {
+                                    width: parent.width
+                                    height: footerLabel.implicitHeight + units.gu(2)
+
+                                    Label {
+                                        id: footerLabel
+                                        y: units.gu(1)
+                                        width: parent.width
+                                        horizontalAlignment: Text.AlignHCenter
+                                        text: root.totalApps > 0 ? root.totalApps + " apps in the catalog"
+                                              : (root.catalogBusy ? "" : "No catalog yet. Tap the refresh button.")
+                                        font.pixelSize: units.gu(1.6)
+                                        color: Pal.textDim
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
-                delegate: ListItem {
-                    height: units.gu(9)
-                    onClicked: root.openDetails(model.pkgId)
+                // ---------- Search ----------
+                Item {
+                    id: searchTab
+                    width: parent.width   // (no anchors: x is animated)
+                    height: parent.height
+                    opacity: root.tab === 1 ? 1 : 0
+                    visible: opacity > 0
+                    enabled: root.tab === 1
+                    x: root.tab === 1 ? 0 : (root.tab < 1 ? units.gu(5) : -units.gu(5))
+                    Behavior on opacity { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+                    Behavior on x { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
 
-                    ListItemLayout {
-                        title.text: model.name
-                        subtitle.text: model.updateAvailable ? model.version + " → " + model.newVersion
-                                       : model.version + (model.local ? " • your own APK" : "")
-
-                        Image {
-                            SlotsLayout.position: SlotsLayout.Leading
-                            width: units.gu(5)
-                            height: width
-                            source: model.icon
-                            fillMode: Image.PreserveAspectFit
-                            asynchronous: true
-                        }
+                    // filter chips
+                    Flickable {
+                        id: chipFlick
+                        anchors { top: parent.top; left: parent.left; right: parent.right }
+                        height: units.gu(7)
+                        contentWidth: chipRow.width + units.gu(4)
+                        flickableDirection: Flickable.HorizontalFlick
+                        clip: true
 
                         Row {
-                            SlotsLayout.position: SlotsLayout.Trailing
+                            id: chipRow
+                            x: units.gu(2)
+                            y: units.gu(1.2)
                             spacing: units.gu(1)
 
-                            Button {
-                                width: units.gu(11)
-                                text: model.busy ? Math.round(model.progress * 100) + "%"
-                                      : (model.updateAvailable ? "Update" : "Open")
-                                enabled: !model.busy
-                                color: model.updateAvailable ? theme.palette.normal.activity
-                                                             : theme.palette.normal.positive
-                                onClicked: model.updateAvailable ? root.installApp(model.pkgId)
-                                                                 : root.launchApp(model.pkgId)
+                            Chip {
+                                text: "No native code"
+                                glyph: "✔"
+                                selected: root.compatOnly
+                                onClicked: { root.compatOnly = !root.compatOnly; root.doSearch(); }
                             }
-                            Button {
-                                width: units.gu(5)
-                                iconName: "delete"
-                                color: theme.palette.normal.negative
-                                onClicked: root.removeApp(model.pkgId)
+                            Chip {
+                                visible: root.searchCategory !== ""
+                                text: root.searchCategory
+                                selected: true
+                                closable: true
+                                onClicked: root.setCategory("")
                             }
+                            Chip {
+                                visible: root.searchSort !== ""
+                                text: root.searchSort === "new" ? "New apps" : "Recently updated"
+                                selected: true
+                                closable: true
+                                onClicked: root.setSort("")
+                            }
+                        }
+                    }
+
+                    // history + categories (nothing typed yet)
+                    Flickable {
+                        id: browseFlick
+                        anchors { top: chipFlick.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
+                        contentHeight: browseColumn.height + units.gu(3)
+                        clip: true
+                        opacity: root.browsing ? 1 : 0
+                        visible: opacity > 0
+                        Behavior on opacity { NumberAnimation { duration: Pal.med } }
+
+                        Column {
+                            id: browseColumn
+                            width: parent.width
+
+                            Item {
+                                width: parent.width
+                                height: root.searchHistory.length > 0 ? units.gu(6) : 0
+                                visible: height > 0
+
+                                Label {
+                                    anchors { left: parent.left; leftMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                                    text: "Recent searches"
+                                    font.pixelSize: units.gu(1.9)
+                                    color: Pal.textDim
+                                }
+                                Ripple {
+                                    anchors { right: parent.right; rightMargin: units.gu(1.5); verticalCenter: parent.verticalCenter }
+                                    width: clearLabel.width + units.gu(3)
+                                    height: units.gu(4.2)
+                                    radius: height / 2
+                                    onClicked: root.clearHistory()
+                                    Label {
+                                        id: clearLabel
+                                        anchors.centerIn: parent
+                                        text: "Clear"
+                                        font.pixelSize: units.gu(1.8)
+                                        color: Pal.primary
+                                    }
+                                }
+                            }
+
+                            Repeater {
+                                model: root.searchHistory
+                                delegate: Ripple {
+                                    width: browseColumn.width
+                                    height: units.gu(6.6)
+                                    onClicked: {
+                                        searchField.text = modelData;
+                                        searchField.cursorPosition = searchField.text.length;
+                                        root.addHistory(modelData);
+                                    }
+
+                                    Rectangle {
+                                        id: histTile
+                                        anchors { left: parent.left; leftMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                                        width: units.gu(4.6)
+                                        height: width
+                                        radius: width / 2
+                                        color: Pal.surface
+                                        Label { anchors.centerIn: parent; text: "↺"; font.pixelSize: units.gu(2.6); color: Pal.textDim }
+                                    }
+                                    Label {
+                                        anchors { left: histTile.right; leftMargin: units.gu(2); right: parent.right; rightMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                                        text: modelData
+                                        font.pixelSize: units.gu(2.1)
+                                        color: Pal.text
+                                        elide: Text.ElideRight
+                                    }
+                                }
+                            }
+
+                            Item {
+                                width: parent.width
+                                height: categoryModel.count > 0 ? units.gu(7) : 0
+                                visible: height > 0
+                                Label {
+                                    anchors { left: parent.left; leftMargin: units.gu(2); verticalCenter: parent.verticalCenter }
+                                    text: "Categories"
+                                    font.pixelSize: units.gu(1.9)
+                                    color: Pal.textDim
+                                }
+                            }
+
+                            Flow {
+                                x: units.gu(2)
+                                width: parent.width - units.gu(4)
+                                spacing: units.gu(1)
+
+                                Repeater {
+                                    model: categoryModel
+                                    delegate: Chip {
+                                        text: model.name
+                                        glyph: Pal.glyph(model.name)
+                                        onClicked: root.openCategory(model.name)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // results
+                    ListView {
+                        id: resultsList
+                        anchors { top: chipFlick.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
+                        clip: true
+                        model: storeModel
+                        cacheBuffer: units.gu(40)
+                        opacity: root.browsing ? 0 : 1
+                        visible: opacity > 0
+                        Behavior on opacity { NumberAnimation { duration: Pal.med } }
+                        onAtYEndChanged: if (atYEnd) root.loadMore()
+                        onMovementStarted: Qt.inputMethod.hide()
+
+                        delegate: AppRow {
+                            pkgId: model.pkgId
+                            name: model.name
+                            summary: model.summary
+                            icon: model.icon
+                            version: model.version
+                            size: model.size
+                            isNative: model.native
+                            verified: model.verified
+                            installed: model.installed
+                            updateAvailable: model.updateAvailable
+                            newVersion: model.newVersion
+                            busy: model.busy
+                            progress: model.progress
+                            onOpened: { root.addHistory(searchField.text); root.openDetails(model.pkgId); }
+                            onAction: (model.installed && !model.updateAvailable)
+                                      ? root.launchApp(model.pkgId) : root.installApp(model.pkgId)
+                        }
+
+                        add: Transition {
+                            ParallelAnimation {
+                                NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Pal.med }
+                                NumberAnimation { property: "x"; from: units.gu(4); to: 0; duration: Pal.med; easing.type: Easing.OutCubic }
+                            }
+                        }
+
+                        Label {
+                            anchors.centerIn: parent
+                            opacity: (storeModel.count === 0 && !root.storeLoading) ? 1 : 0
+                            Behavior on opacity { NumberAnimation { duration: Pal.med } }
+                            text: "No apps found"
+                            font.pixelSize: units.gu(2.2)
+                            color: Pal.textDim
                         }
                     }
                 }
 
-                Label {
-                    anchors.centerIn: parent
-                    visible: libraryModel.count === 0
-                    text: "You haven't installed any apps yet.\nTap + above to add your own APK"
+                // ---------- My apps ----------
+                Item {
+                    id: myAppsTab
+                    width: parent.width   // (no anchors: x is animated)
+                    height: parent.height
+                    opacity: root.tab === 2 ? 1 : 0
+                    visible: opacity > 0
+                    enabled: root.tab === 2
+                    x: root.tab === 2 ? 0 : units.gu(5)
+                    Behavior on opacity { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+                    Behavior on x { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+
+                    ListView {
+                        id: libraryList
+                        anchors.fill: parent
+                        clip: true
+                        model: libraryModel
+
+                        header: Item {
+                            width: libraryList.width
+                            height: units.gu(6.5) + (root.updatesCount > 0 ? units.gu(7.5) : 0)
+                            clip: true
+                            Behavior on height { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+
+                            Label {
+                                anchors { left: parent.left; leftMargin: units.gu(2); top: parent.top; topMargin: units.gu(1.5) }
+                                text: "Installed apps"
+                                font.pixelSize: units.gu(2.6)
+                                color: Pal.text
+                            }
+
+                            Ripple {
+                                x: units.gu(2)
+                                y: units.gu(6.5)
+                                width: parent.width - units.gu(4)
+                                height: units.gu(5.6)
+                                radius: height / 2
+                                opacity: root.updatesCount > 0 ? 1 : 0
+                                Behavior on opacity { NumberAnimation { duration: Pal.med } }
+                                onClicked: root.updateAll()
+
+                                Rectangle { anchors.fill: parent; radius: parent.radius; color: Pal.primary }
+                                Label {
+                                    anchors.centerIn: parent
+                                    text: "Update all (" + root.updatesCount + ")"
+                                    font.pixelSize: units.gu(2)
+                                    font.bold: true
+                                    color: Pal.onPrimary
+                                }
+                            }
+                        }
+
+                        delegate: AppRow {
+                            pkgId: model.pkgId
+                            name: model.name
+                            icon: model.icon
+                            version: model.version
+                            newVersion: model.newVersion
+                            local: model.local
+                            installed: true
+                            showKind: false
+                            updateAvailable: model.updateAvailable
+                            busy: model.busy
+                            progress: model.progress
+                            expandable: true
+                            onOpened: root.openDetails(model.pkgId)
+                            onAction: model.updateAvailable ? root.installApp(model.pkgId) : root.launchApp(model.pkgId)
+                            onAddToDrawer: root.addToDrawer(model.pkgId)
+                            onRemoved: root.removeApp(model.pkgId)
+                        }
+
+                        add: Transition {
+                            ParallelAnimation {
+                                NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Pal.med }
+                                NumberAnimation { property: "x"; from: units.gu(4); to: 0; duration: Pal.med; easing.type: Easing.OutCubic }
+                            }
+                        }
+                        remove: Transition {
+                            ParallelAnimation {
+                                NumberAnimation { property: "opacity"; to: 0; duration: Pal.med }
+                                NumberAnimation { property: "x"; to: units.gu(6); duration: Pal.med; easing.type: Easing.InCubic }
+                            }
+                        }
+                        displaced: Transition {
+                            NumberAnimation { properties: "y"; duration: Pal.med; easing.type: Easing.OutCubic }
+                        }
+
+                        Label {
+                            anchors.centerIn: parent
+                            width: parent.width - units.gu(8)
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                            opacity: libraryModel.count === 0 ? 1 : 0
+                            Behavior on opacity { NumberAnimation { duration: Pal.slow } }
+                            text: "You haven't installed any apps yet.\nTap ⋮ → Add APK to add your own APK"
+                            font.pixelSize: units.gu(2)
+                            color: Pal.textDim
+                        }
+                    }
                 }
             }
 
-            Timer {
-                id: searchTimer
-                interval: 350
-                onTriggered: root.doSearch()
+            // =============== bottom navigation ===============
+            Rectangle {
+                id: nav
+                anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
+                height: units.gu(9.5)
+                color: Pal.surface
+                z: 6
+
+                Item {
+                    id: navRow
+                    anchors.fill: parent
+
+                    // the pill that slides behind the selected icon
+                    Rectangle {
+                        width: units.gu(10.5)
+                        height: units.gu(4.6)
+                        radius: height / 2
+                        y: units.gu(1.2)
+                        x: root.tab * navRow.width / 3 + (navRow.width / 3 - width) / 2
+                        color: Pal.primary
+                        Behavior on x { NumberAnimation { duration: 360; easing.type: Easing.OutBack; easing.overshoot: 0.9 } }
+                    }
+
+                    Repeater {
+                        model: [
+                            { icon: "home", label: "Discover" },
+                            { icon: "search", label: "Search" },
+                            { icon: "view-grid-symbolic", label: "My apps" }
+                        ]
+
+                        delegate: Ripple {
+                            x: index * navRow.width / 3
+                            width: navRow.width / 3
+                            height: navRow.height
+                            pressScale: false
+                            onClicked: root.tab = index
+
+                            Icon {
+                                id: navIcon
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: units.gu(2.5)
+                                width: units.gu(2.8)
+                                height: width
+                                name: modelData.icon
+                                color: root.tab === index ? Pal.onPrimary : Pal.textDim
+                                scale: root.tab === index ? 1.12 : 1
+                                Behavior on color { ColorAnimation { duration: Pal.med } }
+                                Behavior on scale { NumberAnimation { duration: Pal.med; easing.type: Easing.OutBack } }
+                            }
+
+                            // update count badge on "My apps"
+                            Rectangle {
+                                visible: index === 2
+                                x: navIcon.x + navIcon.width - units.gu(0.4)
+                                y: units.gu(1.4)
+                                width: units.gu(2.4)
+                                height: width
+                                radius: width / 2
+                                color: Pal.danger
+                                scale: (index === 2 && root.updatesCount > 0) ? 1 : 0
+                                Behavior on scale { NumberAnimation { duration: Pal.med; easing.type: Easing.OutBack } }
+                                Label {
+                                    anchors.centerIn: parent
+                                    text: root.updatesCount
+                                    font.pixelSize: units.gu(1.4)
+                                    font.bold: true
+                                    color: "#FFFFFF"
+                                }
+                            }
+
+                            Label {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: units.gu(6.6)
+                                text: modelData.label
+                                font.pixelSize: units.gu(1.7)
+                                font.bold: root.tab === index
+                                color: root.tab === index ? Pal.text : Pal.textDim
+                            }
+                        }
+                    }
+                }
+            }
+
+            // =============== toast (status messages) ===============
+            Rectangle {
+                id: toast
+                readonly property bool shown: root.statusText !== "" && !root.toastDismissed
+                anchors { left: parent.left; right: parent.right; bottom: nav.top; leftMargin: units.gu(2); rightMargin: units.gu(2); bottomMargin: units.gu(1.5) }
+                height: toastLabel.implicitHeight + units.gu(3)
+                radius: units.gu(1.5)
+                color: Pal.dark ? "#E3E2E9" : "#2F3036"
+                opacity: shown ? 1 : 0
+                visible: opacity > 0
+                z: 10
+                Behavior on opacity { NumberAnimation { duration: Pal.med } }
+                transform: Translate {
+                    y: toast.shown ? 0 : units.gu(4)
+                    Behavior on y { NumberAnimation { duration: Pal.med; easing.type: Easing.OutCubic } }
+                }
+
+                Label {
+                    id: toastLabel
+                    anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: units.gu(2); rightMargin: units.gu(2) }
+                    text: root.toastText
+                    wrapMode: Text.WordWrap
+                    maximumLineCount: 4
+                    elide: Text.ElideRight
+                    font.pixelSize: units.gu(1.7)
+                    color: Pal.dark ? "#1A1B21" : "#F1F0F7"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (root.lastRunPkg !== "" && root.statusText.indexOf("log") !== -1) {
+                            stack.push(Qt.resolvedUrl("LogPage.qml"), { py: py, pkgId: root.lastRunPkg });
+                        }
+                        root.toastDismissed = true;
+                    }
+                }
+            }
+
+            // =============== ⋮ menu ===============
+            MouseArea {
+                anchors.fill: parent
+                z: 20
+                visible: root.menuOpen
+                onClicked: root.menuOpen = false
+            }
+
+            Rectangle {
+                id: menu
+                anchors { top: parent.top; right: parent.right; topMargin: units.gu(6.5); rightMargin: units.gu(1.5) }
+                width: units.gu(24)
+                height: menuColumn.height + units.gu(2)
+                radius: units.gu(1.5)
+                color: Pal.surfaceHi
+                border.width: units.dp(1)
+                border.color: Pal.outline
+                z: 21
+                opacity: root.menuOpen ? 1 : 0
+                scale: root.menuOpen ? 1 : 0.85
+                transformOrigin: Item.TopRight
+                visible: opacity > 0
+                Behavior on opacity { NumberAnimation { duration: Pal.fast } }
+                Behavior on scale { NumberAnimation { duration: Pal.med; easing.type: Easing.OutBack; easing.overshoot: 1.2 } }
+
+                Column {
+                    id: menuColumn
+                    y: units.gu(1)
+                    width: parent.width
+
+                    Repeater {
+                        model: [
+                            { id: "add", text: "Add APK" },
+                            { id: "log", text: "Last log" },
+                            { id: "settings", text: "Settings" }
+                        ]
+                        delegate: Ripple {
+                            width: menu.width
+                            height: units.gu(5.8)
+                            enabled: modelData.id !== "log" || root.lastRunPkg !== ""
+                            opacity: enabled ? 1 : 0.4
+                            onClicked: { root.menuOpen = false; mainPage.menuAction(modelData.id); }
+
+                            Label {
+                                anchors { left: parent.left; leftMargin: units.gu(2.2); verticalCenter: parent.verticalCenter }
+                                text: modelData.text
+                                font.pixelSize: units.gu(2)
+                                color: Pal.text
+                            }
+                        }
+                    }
+                }
             }
         }
     }

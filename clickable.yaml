@@ -2,6 +2,8 @@ clickable_minimum_required: 7.0.0
 builder: precompiled
 restrict_arch: arm64
 kill: qmlscene
+# The default droidstore.apparmor has no write_path, so the click review passes (OpenStore needs that).
+# Sideloading with app drawer entries: see README (droidstore-drawer.apparmor + clickable build --skip-review).
 # the ATL source, the build scripts and the tests are not needed on the phone (usr/ is)
 ignore:
   - atl
